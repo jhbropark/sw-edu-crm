@@ -1,0 +1,221 @@
+// SW 교육 CRM — Phase 1 스키마
+// Postgres + Prisma. `npx prisma migrate dev` 로 적용.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL") // 풀러(pgbouncer) 환경에서 마이그레이션용 (없으면 url 사용)
+}
+
+// ───────────────────────── 사용자(운영자) ─────────────────────────
+model User {
+  id        String   @id @default(cuid())
+  email        String   @unique
+  name         String?
+  passwordHash String?
+  role         Role     @default(OWNER)
+  createdAt DateTime @default(now())
+  leads     Lead[]
+}
+
+enum Role {
+  OWNER
+  STAFF
+}
+
+// ───────────────────────── 리드(잠재고객) ─────────────────────────
+model Lead {
+  id           String    @id @default(cuid())
+  name         String
+  phone        String?
+  email        String?
+  source       String?   // blog, instagram, offline, referral, ...
+  stage        Stage     @default(NEW)
+  interest     String?   // 관심 강의/주제
+  memo         String?
+  nextActionAt DateTime? // 다음 후속 연락 예정일
+  owner        User?     @relation(fields: [ownerId], references: [id])
+  ownerId      String?
+  contact      Contact?  @relation(fields: [contactId], references: [id])
+  contactId    String?
+  activities   Activity[]
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([stage])
+  @@index([nextActionAt])
+  @@index([createdAt])
+}
+
+enum Stage {
+  NEW        // 신규 문의
+  CONTACTED  // 1차 연락
+  CONSULTING // 상담중
+  PROPOSAL   // 제안/견적
+  WON        // 결제 전환
+  LOST       // 종료(미전환)
+}
+
+// ───────────────────────── 고객 ─────────────────────────
+model Contact {
+  id          String       @id @default(cuid())
+  name        String
+  phone       String?
+  email       String?
+  tags        String[]     // 재마케팅 세그먼트
+  consentAt   DateTime?    // 마케팅 수신 동의 일시
+  consentCh   String?      // email | alimtalk | sms
+  createdAt   DateTime     @default(now())
+  leads       Lead[]
+  enrollments Enrollment[]
+  payments    Payment[]
+
+  @@index([phone])
+  @@index([email])
+}
+
+// ───────────────────────── 강의/상품 ─────────────────────────
+model Course {
+  id          String       @id @default(cuid())
+  title       String
+  format      Format       @default(ONLINE)
+  price       Int          // KRW
+  active      Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+  enrollments Enrollment[]
+}
+
+enum Format {
+  ONLINE
+  OFFLINE
+  HYBRID
+}
+
+// ───────────────────────── 수강 등록(LMS 확장 골격) ─────────────────────────
+model Enrollment {
+  id        String   @id @default(cuid())
+  contact   Contact  @relation(fields: [contactId], references: [id])
+  contactId String
+  course    Course   @relation(fields: [courseId], references: [id])
+  courseId  String
+  status    String   @default("active") // active | completed | refunded
+  startAt   DateTime?
+  payment   Payment?
+  createdAt DateTime @default(now())
+}
+
+// ───────────────────────── 결제 ─────────────────────────
+model Payment {
+  id           String     @id @default(cuid())
+  contact      Contact    @relation(fields: [contactId], references: [id])
+  contactId    String
+  amount       Int        // KRW
+  status       PayStatus  @default(PENDING) // 웹훅으로 갱신
+  method       String?    // card | transfer | ...
+  provider     String?    // toss | portone
+  providerTxId String?    // 결제사 거래 ID
+  paidAt       DateTime?
+  refundedAt   DateTime?
+  receiptUrl   String?    // 토스 결제 영수증 URL
+  taxType      String?    // cash_receipt | tax_invoice
+  taxStatus    String     @default("none") // none | requested | issued
+  taxInfo      String?    // 현금영수증 번호(휴대폰/현금영수증카드) 또는 사업자번호/상호
+  taxIssuedAt  DateTime?
+  enrollment   Enrollment? @relation(fields: [enrollmentId], references: [id])
+  enrollmentId String?     @unique
+  createdAt    DateTime   @default(now())
+
+  @@index([status])
+  @@index([paidAt])
+  @@index([createdAt])
+}
+
+enum PayStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  PARTIAL_REFUND
+}
+
+// ───────────────────────── 활동 로그(타임라인) ─────────────────────────
+model Activity {
+  id        String   @id @default(cuid())
+  lead      Lead?    @relation(fields: [leadId], references: [id])
+  leadId    String?
+  type      String   // call | message | meeting | note
+  content   String
+  createdAt DateTime @default(now())
+
+  @@index([leadId, createdAt])
+}
+
+// ───────────────────────── 마케팅 캠페인/시퀀스 ─────────────────────────
+model Campaign {
+  id        String         @id @default(cuid())
+  name      String
+  channel   String         // email | alimtalk | sms
+  trigger   String?        // e.g. "enrollment.completed+90d"
+  status    String         @default("draft") // draft | active | paused
+  steps     CampaignStep[]
+  createdAt DateTime       @default(now())
+}
+
+model CampaignStep {
+  id         String   @id @default(cuid())
+  campaign   Campaign @relation(fields: [campaignId], references: [id])
+  campaignId String
+  order      Int      @default(0)
+  delayDays  Int      // 트리거 후 N일 뒤
+  template   String   // 메시지 본문/템플릿코드
+  variant    String?  // null=공통, "A"/"B"=A/B 분기
+}
+
+// ───────────────────────── 예약/발송 큐 ─────────────────────────
+model ScheduledMessage {
+  id         String   @id @default(cuid())
+  contactId  String
+  channel    String   // email | alimtalk | sms
+  subject    String?  // 알림톡: templateId 저장
+  body       String
+  sendAt     DateTime
+  status     String   @default("queued") // queued | sent | failed
+  sentAt     DateTime?
+  error      String?
+  campaignId String?
+  stepId     String?
+  dedupeKey  String?  @unique // "{campaignId}:{stepId}:{contactId}" 중복적재 방지
+  createdAt  DateTime @default(now())
+
+  @@index([status, sendAt])
+}
+
+// ───────────────────────── 앱 설정(싱글톤) ─────────────────────────
+model AppSetting {
+  id             String   @id @default("singleton")
+  businessName   String?  // 상호/브랜드명 (메시지 머리말 등)
+  senderName     String?  // 발신자 표기명
+  senderPhone    String?  // 대표 연락처
+  defaultChannel String   @default("alimtalk") // 캠페인 기본 채널
+  retentionDays  Int      @default(365)        // 개인정보 보관기간(일)
+  updatedAt      DateTime @updatedAt
+}
+
+// ───────────────────────── 감사 로그 ─────────────────────────
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String?
+  actorEmail String?
+  action     String   // lead.stage_change | campaign.create | payment.tax_issue | settings.update ...
+  entity     String?  // lead | campaign | payment | setting
+  entityId   String?
+  meta       String?  // JSON 문자열
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([entity, entityId])
+}
